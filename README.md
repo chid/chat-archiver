@@ -44,6 +44,13 @@ rebuild — the property the offset resume has to satisfy.
 
 ## Known limits
 
+- Supports Claude Desktop and Claude Code only. It does not archive Codex or
+  other chat apps.
+- Filenames use a normalized title slug, lowercased with punctuation removed
+  and limited to 60 characters, followed by the first eight characters of the
+  session ID. A short hash is added if two sessions would otherwise collide.
+- A filename can change on a later run if the transcript reveals its title or
+  date after the first archive pass.
 - Offsets resume at turn boundaries, so a tool result whose call sits in an
   earlier chunk renders without its result under `--tools full`.
 - Deleting a session leaves its Markdown behind; the archive only grows.
