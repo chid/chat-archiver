@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive Claude Desktop + Claude Code chats to Markdown, incrementally.
+"""Archive Claude Desktop, Claude Code, and Codex chats to Markdown, incrementally.
 
 Transcripts are append-only JSONL, so each run resumes from the byte offset it
 reached last time and appends. Nothing is re-parsed and nothing is re-rendered.
@@ -11,6 +11,7 @@ reached last time and appends. Nothing is re-parsed and nothing is re-rendered.
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sys, time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,8 +71,9 @@ def clip(s: str, n: int) -> str:
 
 # ---------------------------------------------------------------- discovery
 
-def discover() -> list[dict]:
+def discover(saved_sessions: dict | None = None, quiet: bool = False) -> list[dict]:
     """Locate every transcript and the metadata that names it."""
+    saved_sessions = saved_sessions or {}
     # Claude Code sessions launched from the desktop app keep their state file
     # in the app dir but write transcripts to the normal CLI location, so index
     # them by cliSessionId to recover titles.
@@ -110,6 +112,86 @@ def discover() -> list[dict]:
                 meta = by_cli.get(js.stem, {})
                 kind = "code-app" if meta else "code-cli"
             out.append({"path": js, "size": sz, "surface": kind, "meta": meta})
+
+    # Codex keeps active rollouts in dated folders and moves completed sessions
+    # into archived_sessions. session_meta.id stays stable across that move.
+    codex_index = {}
+    index_path = HOME / ".codex/session_index.jsonl"
+    if index_path.exists():
+        try:
+            with index_path.open() as fh:
+                for line in fh:
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(item, dict) and item.get("id"):
+                        codex_index[item["id"]] = item
+        except OSError:
+            pass
+
+    by_session = defaultdict(list)
+    for root in (HOME / ".codex/sessions", HOME / ".codex/archived_sessions"):
+        if not root.is_dir():
+            continue
+        for js in root.glob("**/rollout-*.jsonl"):
+            try:
+                sz = js.stat().st_size
+                with js.open("rb") as fh:
+                    first = json.loads(fh.readline())
+            except (OSError, ValueError):
+                continue
+            if not sz or not isinstance(first, dict) or first.get("type") != "session_meta":
+                continue
+            meta = first.get("payload")
+            if not isinstance(meta, dict) or not meta.get("id"):
+                continue
+            sid = str(meta["id"])
+            index_entry = codex_index.get(sid, {})
+            meta = {
+                "title": index_entry.get("thread_name") or "",
+                "cwd": meta.get("cwd") or "",
+                "created": meta.get("timestamp") or "",
+                "model": meta.get("model") or "",
+                "source": meta.get("source") or "",
+            }
+            by_session[sid].append({
+                "path": js, "size": sz, "surface": "codex", "meta": meta,
+                "key": f"codex:{sid}", "session_id": sid,
+                "metadata_revision": meta["title"],
+            })
+
+    def is_prefix(shorter: Path, longer: Path) -> bool:
+        """Whether the shorter duplicate transcript is a byte prefix."""
+        try:
+            with shorter.open("rb") as a, longer.open("rb") as b:
+                while chunk := a.read(1024 * 1024):
+                    if b.read(len(chunk)) != chunk:
+                        return False
+            return True
+        except OSError:
+            return False
+
+    # Prefer a complete extension when duplicate active/archive copies exist.
+    # Divergent copies are unsafe to merge: retain the prior source if possible,
+    # otherwise skip the session so a different history is not appended.
+    for sid, candidates in by_session.items():
+        key = f"codex:{sid}"
+        ordered = sorted(candidates, key=lambda r: (r["size"], str(r["path"]).startswith(str(HOME / ".codex/archived_sessions"))))
+        compatible = all(is_prefix(a["path"], b["path"])
+                         for a, b in zip(ordered, ordered[1:]))
+        if compatible:
+            out.append(ordered[-1])
+        else:
+            prior_path = saved_sessions.get(key, {}).get("source_path")
+            prior = next((r for r in candidates if str(r["path"]) == prior_path), None)
+            if prior is not None:
+                out.append(prior)
+                if not quiet:
+                    print(f"warning: divergent Codex copies for {sid}; keeping indexed source", file=sys.stderr)
+            else:
+                if not quiet:
+                    print(f"warning: divergent Codex copies for {sid}; skipping session", file=sys.stderr)
     # Sorted by path so that name-collision resolution is deterministic.
     return sorted(out, key=lambda r: str(r["path"]))
 
@@ -119,8 +201,9 @@ def discover() -> list[dict]:
 class Turn:
     """One speaker's contiguous run of blocks, flushed at a turn boundary."""
 
-    def __init__(self, role: str, side: bool = False):
+    def __init__(self, role: str, side: bool = False, assistant_label: str = "Claude"):
         self.role, self.side, self.events = role, side, []
+        self.assistant_label = assistant_label
 
 
 class Renderer:
@@ -140,6 +223,11 @@ class Renderer:
 
     def tool_line(self, name, inp) -> str:
         arg = ""
+        if isinstance(inp, str):
+            try:
+                inp = json.loads(inp)
+            except ValueError:
+                arg = inp.replace("\n", " ")
         if isinstance(inp, dict):
             for k in TOOL_ARGS:
                 if v := inp.get(k):
@@ -147,6 +235,8 @@ class Renderer:
                     break
             else:
                 arg = ", ".join(f"{k}={str(v)[:40]}" for k, v in list(inp.items())[:2])
+        elif not arg and inp is not None:
+            arg = str(inp).replace("\n", " ")
         return f"`{self.short(name)}` {clip(arg, self.opt.arg_chars)}".rstrip()
 
     def block_md(self, b: dict) -> str:
@@ -184,7 +274,7 @@ class Renderer:
         body = "\n\n".join(p for p in parts if p).strip()
         if not body:
             return ""
-        who = {"user": "### 👤 User", "assistant": "### 🤖 Claude"}[turn.role]
+        who = {"user": "### 👤 User", "assistant": f"### 🤖 {turn.assistant_label}"}[turn.role]
         if turn.side:
             who += " *(subagent)*"
         return f"{who}\n\n{body}\n"
@@ -315,6 +405,182 @@ def convert(rec: dict, state: dict, opt, ren: Renderer) -> tuple[str, dict, str]
     return md, new, title
 
 
+def convert_codex(rec: dict, state: dict, opt, ren: Renderer) -> tuple[str, dict, str]:
+    """Convert completed Codex tasks, leaving the active task for the next run."""
+    path: Path = rec["path"]
+    meta = rec["meta"]
+    offset = state.get("offset", 0)
+    # A session-index title can appear after the first transcript records.
+    title = meta.get("title") or state.get("title") or ""
+    first = state.get("first_ts") or ts_iso(meta.get("created"))
+    last = state.get("last_ts", "")
+    model = state.get("model") or meta.get("model") or ""
+    cwd = state.get("cwd") or meta.get("cwd") or ""
+    counts = {"user": state.get("n_user", 0), "assistant": state.get("n_assistant", 0),
+              "tool": state.get("n_tool", 0)}
+    committed = dict(counts)
+    committed_first, committed_last = first, last
+    safe = offset
+    chunks: list[str] = []
+    pending: list[Turn] = []
+    tools: dict[str, list] = {}
+    turn: Turn | None = None
+
+    def end_turn() -> None:
+        nonlocal turn
+        if turn is not None:
+            pending.append(turn)
+            turn = None
+
+    def start_turn(role: str) -> Turn:
+        nonlocal turn
+        if turn is not None and turn.role != role:
+            end_turn()
+        if turn is None:
+            turn = Turn(role, assistant_label="Codex")
+        return turn
+
+    def add_text(role: str, text: str) -> None:
+        if text.strip():
+            start_turn(role).events.append(("block", {"type": "text", "text": text.strip()}))
+
+    def commit_task(boundary: int) -> None:
+        nonlocal safe, committed, committed_first, committed_last
+        end_turn()
+        chunks.extend(md for item in pending if (md := ren.turn_md(item)))
+        pending.clear()
+        tools.clear()
+        safe = boundary
+        committed = dict(counts)
+        committed_first, committed_last = first, last
+
+    def result_text(value) -> str:
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        while True:
+            pos = fh.tell()
+            line = fh.readline()
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                break
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if event_type == "event_msg":
+                if payload.get("type") == "task_complete":
+                    if ts := ts_iso(event.get("timestamp")):
+                        first, last = first or ts, ts
+                    commit_task(fh.tell())
+                continue
+
+            if event_type != "response_item":
+                continue
+            if ts := ts_iso(event.get("timestamp")):
+                first, last = first or ts, ts
+
+            item_type = payload.get("type")
+            if item_type == "message":
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = payload.get("content")
+                blocks = content if isinstance(content, list) else []
+                texts = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if (block_type in ("input_text", "output_text", "text")
+                            and isinstance(block.get("text"), str)):
+                        texts.append(block["text"])
+                    elif block_type in ("input_image", "image"):
+                        texts.append("*[image attachment — not inlined]*")
+                    elif block_type in ("input_file", "file"):
+                        name = block.get("filename") or "file"
+                        texts.append(f"*[file attachment: {name} — not inlined]*")
+                if isinstance(content, str):
+                    texts = [content]
+                if role == "user":
+                    end_turn()
+                    if not title and texts:
+                        title = clip(next((t.strip().splitlines()[0] for t in texts if t.strip()), ""), 100)
+                for text in texts:
+                    add_text(role, text)
+                if role == "user":
+                    counts["user"] += 1
+                else:
+                    counts["assistant"] += 1
+                continue
+
+            if item_type == "reasoning":
+                if opt.thinking:
+                    summary = payload.get("summary") or []
+                    if isinstance(summary, str):
+                        text = summary
+                    else:
+                        text = "\n".join(b.get("text", "") for b in summary
+                                          if isinstance(b, dict) and isinstance(b.get("text"), str))
+                    if text:
+                        start_turn("assistant").events.append(("block", {
+                            "type": "thinking", "thinking": text,
+                        }))
+                continue
+
+            if item_type in ("function_call", "custom_tool_call", "web_search_call"):
+                call_id = payload.get("call_id") or payload.get("id")
+                name = payload.get("name") or ("web_search" if item_type == "web_search_call" else "tool")
+                arguments = payload.get("arguments", payload.get("input", payload.get("action", {})))
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        pass
+                tool = [name, arguments, None]
+                start_turn("assistant").events.append(("tool", tool))
+                if call_id:
+                    tools[str(call_id)] = tool
+                counts["tool"] += 1
+                continue
+
+            if item_type in ("function_call_output", "custom_tool_call_output"):
+                call = tools.get(str(payload.get("call_id") or ""))
+                if call is not None:
+                    call[2] = result_text(payload.get("output"))
+
+    md = "\n".join(chunks)
+    new = {"offset": safe, "title": title, "first_ts": committed_first,
+           "last_ts": committed_last, "model": model, "cwd": cwd,
+           "n_user": committed["user"], "n_assistant": committed["assistant"],
+           "n_tool": committed["tool"]}
+    return md, new, title
+
+
+def source_marker(path: Path, offset: int) -> str:
+    """Fingerprint the start and committed tail when a session file moves."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        digest.update(fh.read(min(offset, 4096)))
+        if offset > 4096:
+            fh.seek(max(0, offset - 4096))
+            digest.update(fh.read(min(offset, 4096)))
+    return digest.hexdigest()
+
+
 def split_body(txt: str) -> str:
     """Strip the YAML header and H1 so both can be regenerated on append.
 
@@ -340,7 +606,7 @@ def frontmatter(rec, st) -> str:
         "---",
         f"title: {esc(st.get('title') or 'Untitled')}",
         f"surface: {rec['surface']}",
-        f"session: {rec['path'].stem}",
+        f"session: {rec.get('session_id') or rec['path'].stem}",
         f"model: {esc(st.get('model'))}",
         f"cwd: {esc(st.get('cwd'))}",
         f"created: {esc(st.get('first_ts'))}",
@@ -382,26 +648,40 @@ def main() -> int:
     n_new = n_upd = n_skip = 0
     read_bytes = 0
 
-    for rec in discover():
-        key = str(rec["path"])
+    for rec in discover(idx, quiet=opt.quiet):
+        key = rec.get("key", str(rec["path"]))
         st = dict(idx.get(key, {}))
         # Guard against a rewritten or truncated transcript.
         if st and rec["size"] < st.get("offset", 0):
             st = {}
-        if st and rec["size"] == st.get("size_seen"):
+        if st and rec.get("surface") == "codex":
+            offset = st.get("offset", 0)
+            if offset and st.get("source_marker") != source_marker(rec["path"], offset):
+                st = {}
+        same_path = st.get("source_path", str(rec["path"])) == str(rec["path"])
+        same_metadata = st.get("metadata_revision", "") == rec.get("metadata_revision", "")
+        if st and rec["size"] == st.get("size_seen") and same_path and same_metadata:
             n_skip += 1
             continue
 
-        md, new, title = convert(rec, st, opt, ren)
-        read_bytes += rec["size"] - st.get("offset", 0)
+        if rec.get("surface") == "codex":
+            md, new, title = convert_codex(rec, st, opt, ren)
+        else:
+            md, new, title = convert(rec, st, opt, ren)
+        read_bytes += max(0, rec["size"] - st.get("offset", 0))
+        new["metadata_revision"] = rec.get("metadata_revision", "")
+        new["source_path"] = str(rec["path"])
+        if rec.get("surface") == "codex":
+            new["source_marker"] = source_marker(rec["path"], new["offset"])
 
         # A transcript's title and first timestamp can both appear well after
         # its opening lines, so the destination is recomputed every run and any
         # existing file moved to it. Losing the old path would silently restart
         # the archive from the current offset and drop everything before it.
         stamp = (new.get("first_ts") or "")[:7] or "undated"
+        session_token = (rec.get("session_id") or rec["path"].stem)[:8]
         rel = (Path(rec["surface"]) / stamp /
-               f"{slugify(new.get('title') or rec['path'].stem)}-{rec['path'].stem[:8]}.md")
+               f"{slugify(new.get('title') or rec['path'].stem)}-{session_token}.md")
         if claimed.get(str(rel), key) != key:
             rel = rel.with_name(f"{rel.stem}-{hashlib.sha1(key.encode()).hexdigest()[:4]}.md")
         claimed[str(rel)] = key
