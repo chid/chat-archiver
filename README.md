@@ -46,6 +46,11 @@ rebuild — the property the offset resume has to satisfy.
 
     python3 test_incremental.py
 
+`test_codex.py` exercises Codex discovery, tool rendering, completed-task
+offsets, late title updates, and moving a session into the archived directory.
+
+    python3 test_codex.py
+
 ## Known limits
 
 - Supports Claude Desktop, Claude Code, and Codex sessions only. It does not
